@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 use futures::StreamExt;
 use serde::Deserialize;
@@ -23,9 +24,11 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-
-    let gifs = gifs(args.member).await?;
-    download(gifs, args.directory).await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+    let gifs = gifs(&client, args.member).await?;
+    download(&client, gifs, args.directory).await?;
 
     Ok(())
 }
@@ -58,24 +61,27 @@ struct GiphyUser {
 
 #[derive(Error, Debug)]
 enum GiphyError {
-    #[error("Received response error status {code}")]
-    ResponseError { code: u16 },
-    #[error("No source video found for id{0}")]
-    NoSourceVideo(String),
-    #[error("Invalid date {0}")]
-    InvalidDate(String),
+    #[error("Received response error status {code} for url {url}")]
+    ResponseError { code: u16, url: String },
+    #[error("No source video found")]
+    NoSourceVideo,
+    #[error("Invalid date {date}")]
+    InvalidDate { date: String },
 }
 
-async fn gifs(member_id: u64) -> Result<Vec<GiphyGif>> {
+async fn gifs(client: &reqwest::Client, member_id: u64) -> Result<Vec<GiphyGif>> {
     let mut gifs = Vec::new();
     let mut url = format!("https://giphy.com/api/v4/channels/{}/feed", member_id);
 
-    loop {
+    for i in 1.. {
+        println!("Fetching page {}", i);
+
         // Query GIFs
-        let resp = reqwest::get(&url).await?;
+        let resp = client.get(&url).send().await?;
         if !resp.status().is_success() {
             bail!(GiphyError::ResponseError {
-                code: resp.status().as_u16()
+                code: resp.status().as_u16(),
+                url: url.clone(),
             });
         }
 
@@ -94,34 +100,63 @@ async fn gifs(member_id: u64) -> Result<Vec<GiphyGif>> {
     Ok(gifs)
 }
 
-async fn download(gifs: Vec<GiphyGif>, dir: impl AsRef<Path>) -> Result<()> {
-    futures::stream::iter(gifs.into_iter().map(|gif| download_gif(gif, &dir)))
-        .buffer_unordered(20)
-        .collect::<Vec<_>>()
-        .await;
+async fn download(
+    client: &reqwest::Client,
+    gifs: Vec<GiphyGif>,
+    dir: impl AsRef<Path>,
+) -> Result<()> {
+    let results =
+        futures::stream::iter(gifs.into_iter().map(|gif| download_gif(client, gif, &dir)))
+            .buffer_unordered(20)
+            .collect::<Vec<_>>()
+            .await;
+    for r in results {
+        if let Err(e) = r {
+            eprintln!("Failed to download {}", e);
+            e.chain().skip(1).for_each(|cause| eprintln!("  {}", cause));
+        }
+    }
+
     Ok(())
 }
 
-async fn download_gif(gif: GiphyGif, base_dir: impl AsRef<Path>) -> Result<()> {
+async fn download_gif(
+    client: &reqwest::Client,
+    gif: GiphyGif,
+    base_dir: impl AsRef<Path>,
+) -> Result<()> {
+    let id = gif.id.clone();
+    _download_gif(client, gif, base_dir)
+        .await
+        .context(format!("id: {}", id))
+}
+
+async fn _download_gif(
+    client: &reqwest::Client,
+    gif: GiphyGif,
+    base_dir: impl AsRef<Path>,
+) -> Result<()> {
     // Get source url
     let source_url = gif
         .images
         .get("source")
-        .ok_or_else(|| GiphyError::NoSourceVideo(gif.id.clone()))?
+        .ok_or(GiphyError::NoSourceVideo)?
         .get("url")
-        .ok_or_else(|| GiphyError::NoSourceVideo(gif.id.clone()))?
+        .ok_or(GiphyError::NoSourceVideo)?
         .as_str()
-        .ok_or_else(|| GiphyError::NoSourceVideo(gif.id.clone()))?;
+        .ok_or(GiphyError::NoSourceVideo)?;
     let ext = source_url
         .rsplit_once('.')
-        .ok_or_else(|| GiphyError::NoSourceVideo(gif.id.clone()))?
+        .ok_or(GiphyError::NoSourceVideo)?
         .1;
 
     // Generate file name and create directory
     let date = gif
         .create_time
         .split_once('T')
-        .ok_or_else(|| GiphyError::InvalidDate(gif.create_time.clone()))?
+        .ok_or_else(|| GiphyError::InvalidDate {
+            date: gif.create_time.clone(),
+        })?
         .0
         .replace('-', "");
     let filename = format!(
@@ -138,7 +173,7 @@ async fn download_gif(gif: GiphyGif, base_dir: impl AsRef<Path>) -> Result<()> {
     }
 
     // Download
-    let video = reqwest::get(source_url).await?.bytes().await?;
+    let video = client.get(source_url).send().await?.bytes().await?;
     let mut buffer = fs::File::create(&path).await?;
     buffer.write_all(&video).await?;
 
