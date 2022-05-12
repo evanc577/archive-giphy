@@ -63,10 +63,10 @@ struct GiphyUser {
 enum GiphyError {
     #[error("Received response error status {code} for url {url}")]
     ResponseError { code: u16, url: String },
-    #[error("No source video found")]
-    NoSourceVideo,
+    #[error("Invalid source video found")]
+    InvalidSourceVideo,
     #[error("Invalid date {date}")]
-    InvalidDate { date: String },
+    InvalidTime { date: String },
 }
 
 async fn gifs(client: &reqwest::Client, member_id: u64) -> Result<Vec<GiphyGif>> {
@@ -140,21 +140,19 @@ async fn _download_gif(
     let source_url = gif
         .images
         .get("source")
-        .ok_or(GiphyError::NoSourceVideo)?
-        .get("url")
-        .ok_or(GiphyError::NoSourceVideo)?
-        .as_str()
-        .ok_or(GiphyError::NoSourceVideo)?;
+        .and_then(|x| x.get("url"))
+        .and_then(|x| x.as_str())
+        .ok_or(GiphyError::InvalidSourceVideo)?;
     let ext = source_url
         .rsplit_once('.')
-        .ok_or(GiphyError::NoSourceVideo)?
+        .ok_or(GiphyError::InvalidSourceVideo)?
         .1;
 
     // Generate file name and create directory
     let date = gif
         .create_time
         .split_once('T')
-        .ok_or_else(|| GiphyError::InvalidDate {
+        .ok_or_else(|| GiphyError::InvalidTime {
             date: gif.create_time.clone(),
         })?
         .0
